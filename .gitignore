@@ -1,9 +1,13 @@
 # ---- 镜像与二进制（不上传）----
 *.img
 *.bin
+!prebuilt/uefi/BootShim.bin
 *.apfs
 *.elf
 *.fd
+# prebuilt/uefi/ holds the two inputs mkxnuimg.py needs for a boot image: the UEFI firmware
+# (2 MB) and BootShim (176 bytes). Both come from the EDK2 tree, which is not in this repository.
+!prebuilt/uefi/SILICIUM_UEFI.fd
 *.dylib
 *.dmg
 *.iso
