@@ -7,7 +7,9 @@
 *.dylib
 *.dmg
 *.iso
-umi.dtb
+# umi.dtb IS needed: common/build.sh passes it to mkxnuimg.py to append the device tree to the
+# boot image. It is 946 KB and there is no way to regenerate it without the phone.
+# (out/umi-uefi.img already has this DTB embedded, but rebuilding it does not.)
 
 # ---- 上游大仓库（按需自行拉取）----
 Mu-Silicium/
@@ -22,6 +24,11 @@ xnu-deps/
 # ---- 构建产物 ----
 xnu-src/
 out/
+# The one exception: the boot image is 2 MB and needs a 5.3 GB EDK2 tree to rebuild, so it is
+# kept here. The kernel payload next to it (out/umi-final.bin) is NOT kept: it is 20 MB of
+# re-buildable output that goes stale the moment a driver changes, and it is useless without the
+# 2.3 GB system.apfs anyway.
+!out/umi-uefi.img
 userland/obj/
 userland/root/
 .build/*.log
