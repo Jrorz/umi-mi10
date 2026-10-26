@@ -1,0 +1,51 @@
+# ---- 镜像与二进制（不上传）----
+*.img
+*.bin
+*.apfs
+*.elf
+*.fd
+*.dylib
+*.dmg
+*.iso
+umi.dtb
+
+# ---- 上游大仓库（按需自行拉取）----
+Mu-Silicium/
+qemu/
+ios165/
+xnu-deps/
+.build/theos/
+.build/gt9886/
+.venv-linux/
+.userland.git/
+
+# ---- 构建产物 ----
+xnu-src/
+out/
+userland/obj/
+userland/root/
+.build/*.log
+logs/
+*.o
+*.cpo
+*.dSYM/
+
+# ---- 系统与编辑器 ----
+.DS_Store
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+
+# ---- 大数据备份 ----
+umi-backup/
+
+# ---- 不该进仓库的二进制 ----
+prebuilt/mach.development.bcm2837
+.build/shim/tar
+.build/shim/sed
+.build/shim/awk
+.build/shim/timeout
+.build/shim/stat
+.build/shim/7z
+.build/shim/cc

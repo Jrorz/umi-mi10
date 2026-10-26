@@ -1,0 +1,25 @@
+#!/bin/bash
+# Build XNU for redwood on Linux. Extra make args are passed through.
+source "$(dirname "${BASH_SOURCE[0]}")/xnu-env.sh"
+cd "$XNU_SRC" || exit 1
+# stat -c is GNU; macOS spells the modification time -f %m
+if [ "$(uname -s)" = Darwin ]; then mtime() { stat -f %m "$1"; }; else mtime() { stat -c %Y "$1"; }; fi
+# The Wi-Fi driver's object (tools/mk-ath11k.sh) is linked into the kernel when it is there; make
+# does not see it change, so the linked kernel is thrown away when it has.
+LX=$XNUDEPS/build/ath11k/out/ath11k.o
+STAMP=BUILD/obj/redwood-objects
+if [ -f "$LX" ]; then now="$LX $(mtime "$LX")"; else LX= now=; fi
+if [ -d BUILD/obj ] && [ "$(cat $STAMP 2>/dev/null)" != "$now" ]; then
+	rm -f BUILD/obj/*/mach.*.unstripped
+	echo "$now" > $STAMP
+fi
+# The host tools (SETUP) are ordinary macOS programs: on Darwin they are built by the system
+# clang against the system SDK, without the glibc compatibility header that Linux needs.
+if [ "$(uname -s)" = Darwin ]; then
+	HOSTCC="$(xcrun -sdk macosx -find clang) -Wno-unused-command-line-argument -Wno-error=implicit-function-declaration"
+else
+	HOSTCC="clang -include $XNUDEPS/hostinc/hostcompat.h -I$XNUDEPS/hostinc -Wno-unused-command-line-argument -Wno-error=implicit-function-declaration"
+fi
+exec make REDWOOD_OBJECTS="$LX" SDKROOT=iphoneos ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=${MACHINE:-BCM2837} KERNEL_CONFIGS=DEVELOPMENT \
+  ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 BUILD_WERROR=0 BUILD_LTO=0 DO_CTFMERGE=0 \
+  HOST_CC="$HOSTCC" HOST_FLEX=flex HOST_BISON=bison HOST_GM4=m4 CC=xnu-clang CXX=xnu-clang++ LOGCOLORS=n "$@"

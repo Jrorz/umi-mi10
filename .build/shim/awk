@@ -1,0 +1,19 @@
+#!/bin/bash
+# macOS shim: XNU's MakeInc.top reads /proc/meminfo, which does not exist here.
+# If /proc/meminfo is among the inputs, replace that path with a stand-in file carrying the
+# same "MemTotal: <kB> kB" line this machine would report, then run the real awk unchanged.
+args=()
+tmp=
+for a in "$@"; do
+	if [ "$a" = "/proc/meminfo" ]; then
+		tmp=$(mktemp)
+		printf 'MemTotal:       %d kB\n' $(( $(sysctl -n hw.memsize) / 1024 )) > "$tmp"
+		args+=("$tmp")
+	else
+		args+=("$a")
+	fi
+done
+/usr/bin/awk "${args[@]}"
+rc=$?
+[ -n "$tmp" ] && rm -f "$tmp"
+exit $rc

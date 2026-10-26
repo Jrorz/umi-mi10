@@ -1,0 +1,9 @@
+#!/bin/bash
+# macOS has no timedatectl: answer the one question userland/build.sh asks of it.
+# readlink /etc/localtime gives .../zoneinfo/Asia/Shanghai -> Asia/Shanghai
+case "$*" in
+*Timezone*)
+	z=$(readlink /etc/localtime 2>/dev/null | sed -n 's|.*/zoneinfo/||p')
+	echo "${z:-UTC}"
+	;;
+esac
