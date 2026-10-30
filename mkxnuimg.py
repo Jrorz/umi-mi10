@@ -47,13 +47,34 @@ if os.path.isfile(fd_path) and os.path.isdir(os.path.join(MU, 'BootShim')):
              'dtb': os.path.join(MU, f'Resources/DTBs/{TARGET}.dtb'), 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
              'mkbootimg': os.path.join(MU, 'Resources/Scripts/mkbootimg.py')}
 else:
-    parts = {'shim': os.path.join(PREBUILT, 'BootShim.bin'), 'fd': os.path.join(PREBUILT, 'SILICIUM_UEFI.fd'),
-             'dtb': os.path.join(PREBUILT, 'redwood.dtb'), 'ramdisk': os.path.join(PREBUILT, 'ramdisk'),
-             'mkbootimg': os.path.join(PREBUILT, 'mkbootimg.py')}
+    # No Mu-Silicium tree next to us, so the EDK2 build is out of reach and the firmware and
+    # BootShim that were built from it once are used as they are. The device tree and the ramdisk
+    # still come from the caller (or from the tree), because prebuilt/ only ever held redwood's.
+    def pick(name, fallback):
+        return os.environ.get(name) or fallback
+
+    dtb = pick('DTB', os.path.join(HERE, 'umi.dtb') if TARGET == 'umi' else os.path.join(PREBUILT, 'redwood.dtb'))
+    if not os.path.isabs(dtb):
+        dtb = os.path.join(HERE, dtb)
+    ramdisk = pick('RAMDISK', os.path.join(PREBUILT, 'ramdisk'))
+    mkbootimg = pick('MKBOOTIMG', os.path.join(PREBUILT, 'mkbootimg.py'))
+    for label, path in (('device tree', dtb), ('ramdisk', ramdisk), ('mkbootimg', mkbootimg)):
+        if not os.path.isfile(path):
+            raise SystemExit(f'mkxnuimg.py: no {label} at {path}')
+    # umi.dtb is the umi tree, so the firmware beside it must be umi's too, not redwood's.
+    fd = os.environ.get('UEFI_FD') or os.path.join(HERE, f'prebuilt/uefi/{TARGET}/SILICIUM_UEFI.fd')
+    if not os.path.isfile(fd):
+        fd = os.path.join(PREBUILT, 'SILICIUM_UEFI.fd')
+    parts = {'shim': os.path.join(PREBUILT, 'BootShim.bin'), 'fd': fd,
+             'dtb': dtb, 'ramdisk': ramdisk, 'mkbootimg': mkbootimg}
     if os.environ.get('UEFI_FD'): parts['fd'] = os.environ['UEFI_FD']
 shim = open(parts['shim'], 'rb').read()
 fd = open(parts['fd'], 'rb').read()
-assert len(fd) == FD_SIZE, hex(len(fd))
+if len(fd) != FD_SIZE:
+    raise SystemExit(
+        f'mkxnuimg.py: {parts["fd"]} is {len(fd):#x} bytes but FD_SIZE is {FD_SIZE:#x}.\n'
+        f'  The BootShim in {os.path.dirname(parts["shim"])} was assembled for a particular FD_SIZE and both\n'
+        f'  have to agree. Either pass FD_SIZE={len(fd):#x} and rebuild the shim, or use a firmware of {FD_SIZE:#x} bytes.')
 
 blob = shim + fd
 if args.payload:

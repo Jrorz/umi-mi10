@@ -8,6 +8,8 @@
 # prebuilt/uefi/ holds the two inputs mkxnuimg.py needs for a boot image: the UEFI firmware
 # (2 MB) and BootShim (176 bytes). Both come from the EDK2 tree, which is not in this repository.
 !prebuilt/uefi/SILICIUM_UEFI.fd
+# umi's own firmware, kept beside redwood's so the fallback picks the right one per device.
+!prebuilt/uefi/umi/SILICIUM_UEFI.fd
 *.dylib
 *.dmg
 *.iso
