@@ -62,3 +62,6 @@ prebuilt/mach.development.bcm2837
 .build/shim/stat
 .build/shim/7z
 .build/shim/cc
+
+# Working builds stay on this machine; they are not part of the repository.
+backups/

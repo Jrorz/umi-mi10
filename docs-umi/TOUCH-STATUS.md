@@ -2,7 +2,7 @@
 
 > 2026-10-31 更新。所有结论都有设备日志、设备树或参考项目源码作为依据，没有猜测。
 
-## 一、当前状态
+## 一、当前状态：✅ 触摸完全可用
 
 | 阶段 | 状态 | 日志证据 |
 |---|---|---|
@@ -10,12 +10,16 @@
 | 芯片身份识别 | ✅ 通过 | `chip 0x3639, fw 0x128, svn 0x4053, config 0x4b` |
 | 扫描命令下发 | ✅ 成功 | `scan started (A0 00 01, A2 03 ..., A0 00 00, 50 ms, A0 00 01)` |
 | 读取触摸事件 | ✅ 正常 | 单次运行读到 395 个事件 |
-| 事件解析 | ✅ 正确 | `post down id 0 at 394, 1694` / `post move ... 687, 1734` |
-| 坐标范围 | ✅ 正确 | x∈[0,1079], y∈[0,2339] |
-| **交给用户态** | ❌ **卡死** | 一旦 `redwood_touch_post()` 真正投递，系统冻结 |
-| iOS 端接入 | ✅ 就绪 | `digitizer attached` / `acquired main display digitizer` |
+| 事件解析 | ✅ 正确 | `post down id 0 at 394, 1694` |
+| 坐标缩放 | ✅ 正确 | 0..65535 量程（见 bug 11）|
+| 交给用户态 | ✅ 正常 | 全屏可点可滑 |
+| iOS 端接入 | ✅ 正常 | `digitizer attached` / `acquired main display digitizer` |
 
-**结论：内核侧触摸驱动已经完全打通。** 剩下的阻塞点是"把样本交到 `/dev/redwood-touch` 队列"之后，用户态接手时系统冻结。
+**真机确认：2026-10-31，全屏触摸正常。可用版本备份在
+`backups/touch-working-2026-10-31/`。**
+
+中途出现过"投递就卡死"的现象，其实是坐标量纲错误（bug 11）导致用户态收到
+严重越界的坐标。修正缩放后不再出现。
 
 ## 二、已解决的 10 个 bug
 
@@ -150,6 +154,28 @@ if (((ev[0] >> 4) < 1) || ((ev[0] >> 4) > 3)) return true;
 
 参考项目注释：*The low nibble can carry contact-size bits; it is not a fixed 0x3 protocol signature.*
 
+### 11. 坐标没有缩放到队列的 0..65535 量程
+
+`/dev/redwood-touch` 的坐标不是像素，而是 **0..65535**。同一个队列的既有驱动
+`redwood_goodix.c` 在投递前就做了这件事：
+
+```c
+x = (uint32_t)(((uint64_t)x * 65535) / (max_report_x - 1));
+y = (uint32_t)(((uint64_t)y * 65535) / (max_report_y - 1));
+```
+
+```c
+// 错：直接投递像素
+redwood_touch_post(REDWOOD_TOUCH_DOWN, id, x, y);     // y = 1700 → 2.6% 处
+
+// 对
+x = (uint32_t)(((uint64_t)x * 65535) / (max_x - 1));
+y = (uint32_t)(((uint64_t)y * 65535) / (max_y - 1));
+redwood_touch_post(REDWOOD_TOUCH_DOWN, id, x, y);
+```
+
+症状：**只有屏幕最顶部一小条能响应**。修正后全屏正常。
+
 ## 三、硬件参数（全部经设备树核实）
 
 | 项 | 值 | 设备树依据 |
@@ -163,7 +189,10 @@ if (((ev[0] >> 4) < 1) || ((ev[0] >> 4) > 3)) return true;
 | 引脚复用 | active 为 `qup13`，sleep 为 `gpio` | `qupv3_se13_i2c_active/sleep` |
 | 板级升压 | PM8150B SID2 `0xC444 = 0x80` | 参考项目 attempt 80 |
 
-## 四、当前阻塞：交给用户态时冻结
+## 四、曾经出现的"投递即冻结"（已解决）
+
+> 这一节保留下来作为记录。真正的原因是 bug 11 的坐标量纲错误：用户态收到远超出
+> 量程的坐标后行为异常。缩放修好后不再冻结。
 
 ### 现象
 

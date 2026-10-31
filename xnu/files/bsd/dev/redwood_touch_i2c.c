@@ -1179,13 +1179,13 @@ static struct {
  * two questions -- "is the parse right" and "does handing it to user space hurt" -- are separated
  * by turning the hand-off off for one run.
  */
-#define FTS_POST_TO_USER 0      /* 0: count the samples only, 1: hand them to user space */
+#define FTS_POST_TO_USER 1      /* 0: count the samples only, 1: hand them to user space */
 /*
  * Moves are left out for this run. Handing every sample over froze the system while simply counting
  * them did not, and a tap needs only a down and an up, so this separates "the hand-off does not work
  * at all" from "the hand-off is being handed far too much".
  */
-#define FTS_POST_MOVES   0
+#define FTS_POST_MOVES   1
 
 static uint32_t fts_posts;
 static uint32_t fts_shown;
@@ -1258,9 +1258,21 @@ fts_parse(const uint8_t ev[FTS_EVENT_LEN], uint32_t max_x, uint32_t max_y)
 		}
 		return true;
 	}
-	if (x > max_x || y > max_y) {
+	if (x > max_x || y > max_y || max_x < 2 || max_y < 2) {
 		return true;                                    /* out of the panel: their "bad" */
 	}
+	/*
+	 * To the scale the queue carries, which is 0..65535 and not pixels. redwood_goodix.c, the
+	 * driver this device shared the interface with, does exactly this before posting:
+	 *
+	 *     x = (uint32_t)(((uint64_t)x * 65535) / (max_report_x - 1));
+	 *     y = (uint32_t)(((uint64_t)y * 65535) / (max_report_y - 1));
+	 *
+	 * Posting raw pixels instead put a touch at y = 1700 of 65535, about 2.6% down the screen,
+	 * which is why the panel only answered along the very top edge.
+	 */
+	x = (uint32_t)(((uint64_t)x * 65535) / (max_x - 1));
+	y = (uint32_t)(((uint64_t)y * 65535) / (max_y - 1));
 	changed = !contact[id].down || contact[id].x != x || contact[id].y != y;
 	contact[id].x = x;
 	contact[id].y = y;
