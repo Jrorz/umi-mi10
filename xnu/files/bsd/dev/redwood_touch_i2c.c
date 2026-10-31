@@ -52,6 +52,7 @@
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern void IOSleep(unsigned int milliseconds);   /* a real sleep: delay() spins */
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_line(const char *line);
@@ -101,8 +102,16 @@ say(const char *format, ...)
 #define GCC_SIZE                0x60000UL
 #define RSC_PHYS                0x18220000UL    /* umi.dts apps_rsc: drv-2 */
 #define RSC_SIZE                0x10000UL
-#define CMD_DB_PHYS             0x80880000UL    /* umi.dts cmd-db@80880000 */
-#define CMD_DB_SIZE             0x14000UL
+/*
+ * umi.dts: cmd_db: reserved-memory@80860000 { reg = <0x80860000 0x20000> }. This used to read
+ * 0x80880000, which is res_xbl_uefi_log -- the XBL's own log ring -- so the magic came back as
+ * ff ff 7f ff and every lookup failed, including "ldoc1", which left the chip without its I/O
+ * supply. UniXNU-umi's UmiRpmh.c uses DB_BASE 0x80860000, DB_SIZE 0x20000 for the same reason.
+ */
+#define CMD_DB_PHYS             0x80860000UL
+#define CMD_DB_SIZE             0x20000UL
+#define CMD_DB_VERSION          1u
+#define CMD_DB_MAGIC            0x0c0330dbu      /* "db 30 03 0c" in memory order */
 
 static vm_offset_t se, tlmm, gcc, rsc, cmd_db;
 
@@ -310,9 +319,11 @@ rpmh_address(const char *name)
 	const struct cmd_db_header *db = (const struct cmd_db_header *)cmd_db;
 	char id[8] = { 0 };
 
-	if (db->magic[0] != 0xdb || db->magic[1] != 0x30 || db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
-		printf("fts: no command database (magic %02x %02x %02x %02x)\n", db->magic[0], db->magic[1],
-		    db->magic[2], db->magic[3]);
+	if (db->version != CMD_DB_VERSION || db->magic[0] != 0xdb || db->magic[1] != 0x30 ||
+	    db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
+		printf("fts: no command database at %#lx (version %u, magic %02x %02x %02x %02x)\n",
+		    (uint64_t)CMD_DB_PHYS, db->version, db->magic[0], db->magic[1], db->magic[2],
+		    db->magic[3]);
 		return 0;
 	}
 	strlcpy(id, name, sizeof(id));
@@ -324,9 +335,18 @@ rpmh_address(const char *name)
 			continue;
 		}
 		for (unsigned i = 0; i < slave->count; i++) {
-			if (memcmp(entry[i].id, id, sizeof(id)) == 0) {
-				return entry[i].address;
+			if (memcmp(entry[i].id, id, sizeof(id)) != 0) {
+				continue;
 			}
+			/* UmiRpmh.c: the RPMh resource must look like one this vote can address. */
+			if (entry[i].address > 0x7ffff || (entry[i].address & 3) != 0 ||
+			    ((entry[i].address >> 16) & 7) != 4 ||
+			    (((entry[i].address + 4) >> 16) & 7) != 4) {
+				printf("fts: cmd_db: \"%s\" has an address this vote cannot use (%#x)\n", name,
+				    entry[i].address);
+				return 0;
+			}
+			return entry[i].address;
 		}
 	}
 	return 0;
@@ -388,18 +408,28 @@ static bool
 io_supply_on(void)
 {
 	uint32_t base = rpmh_address("ldoc1");
-	uint32_t address[3] = { base + VRM_VOLTAGE, base + VRM_ENABLE, base + VRM_MODE };
-	uint32_t data[3] = { 1800, 1, VRM_MODE_LDO_HPM };
 
-	if (base == 0 || (base >> 16 & 0xf) != 4) {
-		printf("fts: RPMh: no regulator \"ldoc1\" (address %#x)\n", base);
+	if (base == 0) {
+		printf("fts: RPMh: no regulator \"ldoc1\" in the command database\n");
 		return false;
 	}
-	printf("fts: RPMh: ldoc1 is at %#x\n", base);
-	if (!rpmh_write(address, data, 3)) {
-		return false;
+	/*
+	 * One vote, on the enable resource only. UmiRpmh.c is explicit about this: the rail is already
+	 * set to 1800 mV by the boot loader, and the vote is "VRM enable index1, data1/0; no
+	 * voltage/mode request". Writing the voltage and mode as well is what this used to do, which
+	 * programs a regulator the boot loader owns instead of asking RPMh for it.
+	 */
+	{
+		uint32_t address = base + VRM_ENABLE;
+		uint32_t data = 1;
+
+		printf("fts: RPMh: ldoc1 at %#x, voting %#x = 1\n", base, address);
+		if (!rpmh_write(&address, &data, 1)) {
+			printf("fts: RPMh: the ldoc1 enable vote did not complete\n");
+			return false;
+		}
 	}
-	printf("fts: I/O supply on (1.8 V)\n");
+	printf("fts: I/O supply on (the ldoc1 enable vote went through)\n");
 	return true;
 }
 
@@ -427,6 +457,8 @@ io_supply_on(void)
 #define SPMI_CNFG_SIZE          0x26000UL
 #define SPMI_WRITE_PHYS         0x0c600000UL    /* the write channel bank: +0x10000 per channel */
 #define SPMI_OBSERVER_PHYS      0x0e600000UL    /* the read bank: +0x80 per channel */
+#define SPMI_OBSERVER_SIZE      0x10000UL       /* 512 channels of 0x80 */
+#define SPMI_WRITE_PAGE_SIZE    0x1000UL        /* one channel's page in the write bank */
 #define SPMI_ARB_VERSION        0x50010000u     /* what the arbiter must report */
 
 #define SPMI_CHANNEL_MAP(n)     (spmi_core + 0x900 + 4 * (n))   /* [19:8] ppid */
@@ -437,7 +469,9 @@ io_supply_on(void)
 #define SPMI_OBS_DATA_OFFSET    0x18            /* the byte read on the observer bank */
 #define SPMI_READ_OP            (1u << 27)
 
-static vm_offset_t spmi_core, spmi_cnfg;
+static vm_offset_t spmi_core, spmi_cnfg, spmi_observer;
+static vm_offset_t spmi_write_page;             /* the write bank, mapped for one channel */
+static uint32_t spmi_write_channel = ~0u;
 static lck_spin_t *spmi_lock_p;
 static lck_grp_t *spmi_lock_grp;
 static LCK_SPIN_DECLARE(spmi_guard, &spmi_lock_grp);
@@ -447,33 +481,64 @@ static const char *
 spmi_transfer(uint8_t sid, uint16_t address, uint8_t *value, bool write)
 {
 	uint32_t ppid = ((uint32_t)sid << 8) | (address >> 8);
-	uint32_t channel = 0, owner = 7;
-	bool found = false;
+	uint32_t found = ~0u, owner = 7;
+	vm_offset_t channel;
 	const char *problem = "the arbiter did not finish";
-	lck_spin_lock(&spmi_guard);
 
+	/* Which channel serves that peripheral. The two tables are already mapped; the per-channel
+	 * banks are not, and are dealt with below. */
+	lck_spin_lock(&spmi_guard);
 	for (uint32_t i = 0; i < 512; i++) {
 		uint32_t map = rd(SPMI_CHANNEL_MAP(i));
 
-		if (map != 0 && ((map >> 8) & 0xfff) == ppid) {
-			uint32_t who = rd(SPMI_OWNER(i)) & 7;
+		if (map == 0 || ((map >> 8) & 0xfff) != ppid) {
+			continue;
+		}
+		uint32_t who = rd(SPMI_OWNER(i)) & 7;
 
-			channel = write ? (SPMI_WRITE_PHYS + i * 0x10000) : (SPMI_OBSERVER_PHYS + i * 0x80);
+		if (found == ~0u || (write && who == 0)) {
+			found = i;
 			owner = who;
-			found = true;
-			if (write && who == 0) {
-				break;                  /* ours to write through: prefer it */
-			}
+		}
+		if (write && who == 0) {
+			break;                  /* ours to write through: prefer it */
 		}
 	}
-	if (!found) {
-		lck_spin_unlock(&spmi_guard);
+	lck_spin_unlock(&spmi_guard);
+
+	if (found == ~0u) {
 		return "no channel of the arbiter serves that peripheral";
 	}
 	if (write && owner != 0) {
-		lck_spin_unlock(&spmi_guard);
 		return "that peripheral is not this EE's to write";
 	}
+
+	/*
+	 * The window to use, and it has to be a mapped one. SPMI_WRITE_PHYS and SPMI_OBSERVER_PHYS
+	 * above are physical addresses: adding a channel offset to them and then reading or writing
+	 * through the result is what made this driver die with "Kernel data abort ... far 0xe606700"
+	 * the moment the board rail was first looked at. ml_io_map() is called outside the lock
+	 * because it may sleep; only one channel is ever written, so its page is kept.
+	 */
+	if (write) {
+		if (spmi_write_channel != found) {
+			vm_offset_t page = ml_io_map(SPMI_WRITE_PHYS + (vm_offset_t)found * 0x10000,
+			    SPMI_WRITE_PAGE_SIZE);
+
+			if (page == 0) {
+				return "the write bank of that channel cannot be mapped";
+			}
+			spmi_write_page = page;
+			spmi_write_channel = found;
+		}
+		channel = spmi_write_page;
+	} else {
+		if (spmi_observer == 0) {
+			return "the observer bank cannot be mapped";
+		}
+		channel = spmi_observer + (vm_offset_t)found * 0x80;
+	}
+	lck_spin_lock(&spmi_guard);
 	if (write) {
 		wr(channel + SPMI_DATA_OFFSET, *value);
 		wr(channel, ((uint32_t)(address & 0xff)) << 4);         /* bit 27 clear = write */
@@ -536,7 +601,7 @@ board_boost_on(void)
 	} else {
 		printf("fts: the boost rail was already on\n");
 	}
-	delay(4000);                                    /* the 4000us startup delay of that rail */
+	IOSleep(4);                                    /* the 4000us startup delay of that rail */
 
 	/* and read the whole profile back: the rail must now be where it was asked to be */
 	for (unsigned i = 0; i < 11; i++) {
@@ -666,14 +731,6 @@ mark(unsigned slot, uint32_t colour, bool tall)
 #define I2C_WRITE_ADDR          0x92            /* 0x49 << 1 | 0 */
 #define I2C_READ_ADDR           0x93            /* 0x49 << 1 | 1 */
 
-static void
-i2c_line(unsigned pin, bool high)
-{
-	uint32_t io = rd(GPIO_IO(pin));
-
-	wr(GPIO_IO(pin), (io & ~GPIO_OUT_BIT) | (high ? GPIO_OUT_BIT : 0));
-}
-
 static bool
 i2c_read_line(unsigned pin)
 {
@@ -693,25 +750,43 @@ i2c_pin_ctl(unsigned pin)
 	return ctl;
 }
 
-/* make a pin an output at `high`: control word first without drive, then the level, then drive */
+/*
+ * Put a line where the bus wants it, as an open drain does: "high" is not the same as driving the
+ * pin up, it is letting go of it and trusting the pull-up. Only the output-enable bit changes and
+ * the output latch is kept at zero for the whole transfer, which is exactly what UniXNU-umi's
+ * Line() does:
+ *
+ *     MmioWrite32 (GPIO_CTL (Pin), mGpioCtl[Index] | (Released ? 0 : GPIO_OE));
+ *
+ * This driver used to drive SDA both ways. A push-pull master that holds SDA high while the
+ * controller pulls it low to acknowledge a byte wins that fight, so no ACK was ever seen and every
+ * read came back 0xff -- which is what "the controller information is not a valid block (0xff 0xff)"
+ * was: a bus with nothing answering on it.
+ */
+static void
+i2c_line(unsigned pin, bool high)
+{
+	uint32_t ctl = i2c_pin_ctl(pin);
+
+	wr(GPIO_CFG(pin), ctl);                                 /* released: an input */
+	wr(GPIO_IO(pin), rd(GPIO_IO(pin)) & ~GPIO_OUT_BIT);     /* the latch stays at zero */
+	if (!high) {
+		wr(GPIO_CFG(pin), ctl | GPIO_OE_BIT);           /* now sink the line */
+	}
+}
+
+/* kept as the name the transfer code reads better with */
 static void
 i2c_drive(unsigned pin, bool high)
 {
-	uint32_t ctl = i2c_pin_ctl(pin);
-
-	wr(GPIO_CFG(pin), ctl);
 	i2c_line(pin, high);
-	wr(GPIO_CFG(pin), ctl | GPIO_OE_BIT);
 }
 
-/* and back to an input, which is how the chip drives ACK and data */
+/* back to an input, which is how the chip drives ACK and data */
 static void
 i2c_release(unsigned pin)
 {
-	uint32_t ctl = i2c_pin_ctl(pin);
-
-	wr(GPIO_CFG(pin), ctl);
-	wr(GPIO_IO(pin), rd(GPIO_IO(pin)) & ~GPIO_OUT_BIT);    /* latch low, as AcquirePins does */
+	i2c_line(pin, true);
 }
 
 static void
@@ -789,7 +864,13 @@ i2c_read_byte(bool last)
 		value = (uint8_t)((value << 1) | (i2c_read_line(PIN_SDA) ? 1 : 0));
 		i2c_clock_low();
 	}
-	i2c_drive(PIN_SDA, !last);                      /* drive low to acknowledge, release on the last */
+	/*
+	 * Acknowledge every byte but the last, and the polarity here matters: "high" means the line is
+	 * released, so acknowledging is low. This passed !last, which acknowledged only the final byte
+	 * and refused every one before it -- the controller then stopped sending, and a sixteen-byte
+	 * chunk came back as one good byte followed by 0xff.
+	 */
+	i2c_drive(PIN_SDA, last);                       /* sink to ACK, release for the last (NACK) */
 	delay(SCL_HALF_US);
 	i2c_clock_high();
 	i2c_clock_low();
@@ -809,10 +890,28 @@ i2c_pins_init(void)
 	delay(SCL_HALF_US);
 }
 
+/*
+ * A transfer that is cut short can leave the controller holding SDA down, and then every later
+ * transfer fails at its start condition ("the bus was busy"). Clocking SCL up to nine times lets
+ * the slave finish the byte it was in the middle of, and a stop returns the bus to idle.
+ */
+static void
+i2c_bus_recover(void)
+{
+	for (unsigned i = 0; i < 9 && !i2c_read_line(PIN_SDA); i++) {
+		i2c_clock_high();
+		i2c_clock_low();
+	}
+	i2c_stop();
+}
+
 /* write `wn` bytes then read `rn` back, the shape every FTS transfer has */
 static const char *
 i2c_transfer(const uint8_t *write, uint32_t wn, uint8_t *read, uint32_t rn)
 {
+	if (!i2c_read_line(PIN_SDA) && i2c_read_line(PIN_SCL)) {
+		i2c_bus_recover();
+	}
 	if (!i2c_start(false)) {
 		return "the bus was busy";
 	}
@@ -1056,7 +1155,7 @@ fts_start_sensing(bool initial)
 	if (problem != NULL) {
 		return problem;
 	}
-	delay(50000);                           /* WAIT_AFTER_SENSEOFF */
+	IOSleep(50);                           /* WAIT_AFTER_SENSEOFF */
 	problem = i2c_transfer(on, sizeof(on), NULL, 0);
 	return problem;
 }
@@ -1069,13 +1168,42 @@ static struct {
 } contact[FTS_MAX_POINTS];
 
 /*
+ * How many samples actually reached /dev/redwood-touch, and the first few of them with their
+ * coordinates. "2158 events read" said nothing about whether anything was posted: an event that is
+ * a status byte, a lift with nothing down, or out of the panel is read and then dropped, and the run
+ * looks identical from the outside.
+ */
+/*
+ * Set to 0 to count what would be posted without putting it on the queue. The kind check was the
+ * reason nothing was posted at all, and with it fixed the system started freezing instead, so the
+ * two questions -- "is the parse right" and "does handing it to user space hurt" -- are separated
+ * by turning the hand-off off for one run.
+ */
+#define FTS_POST_TO_USER 0      /* 0: count the samples only, 1: hand them to user space */
+/*
+ * Moves are left out for this run. Handing every sample over froze the system while simply counting
+ * them did not, and a tap needs only a down and an up, so this separates "the hand-off does not work
+ * at all" from "the hand-off is being handed far too much".
+ */
+#define FTS_POST_MOVES   0
+
+static uint32_t fts_posts;
+static uint32_t fts_shown;
+
+static bool
+fts_show_post(void)
+{
+	return fts_shown++ < 12;
+}
+
+
+/*
  * Returns false when the controller asked to be reset or reported a fault: the working build
  * stops its worker and lets the startup state machine run the reset, rather than reading on.
  */
 static bool
 fts_parse(const uint8_t ev[FTS_EVENT_LEN], uint32_t max_x, uint32_t max_y)
 {
-	char line[64];
 	uint32_t id, type, x, y;
 	bool changed;
 
@@ -1083,16 +1211,28 @@ fts_parse(const uint8_t ev[FTS_EVENT_LEN], uint32_t max_x, uint32_t max_y)
 		return true;                                    /* no event in this window */
 	}
 	if (ev[0] == FTS_EV_RESET || ev[0] == FTS_EV_FAULT) {
-		vsnprintf(line, sizeof(line), "controller %s\n",
-		    ev[0] == FTS_EV_RESET ? "reset" : "fault");
-		loader_log_line(line);
+		/*
+		 * Nothing is printed from here. Formatting a string here is what crashed the kernel in
+		 * __doprnt (data abort, far equal to the bytes of "reset"), and the caller already says
+		 * that a reset was asked for, so the reason only has to travel back as the return value.
+		 */
 		for (unsigned i = 0; i < FTS_MAX_POINTS; i++) {
 			contact[i].down = false;
 		}
 		return false;
 	}
-	if ((ev[0] & 0x0f) == 3) {
-		return true;                                    /* a status byte, not a contact */
+	/*
+	 * Which kind of report this is: the HIGH nibble, 1 to 3. The low nibble carries contact-size
+	 * bits and is not a fixed signature -- UniXNU-umi's umi_fts_point_event() is
+	 *
+	 *     unsigned kind = code >> 4; return kind >= 1 && kind <= 3;
+	 *
+	 * This used to test "(ev[0] & 0x0f) == 3" and return early, calling it a status byte. Every
+	 * report whose size bits happened to be 3 was therefore thrown away before its contact was
+	 * looked at, which is why a run could read 370 events and post none of them.
+	 */
+	if (((ev[0] >> 4) < 1) || ((ev[0] >> 4) > 3)) {
+		return true;                                    /* not a contact report */
 	}
 	id = ev[1] >> 4;
 	type = ev[1] & 0x0f;
@@ -1107,7 +1247,14 @@ fts_parse(const uint8_t ev[FTS_EVENT_LEN], uint32_t max_x, uint32_t max_y)
 		changed = contact[id].down;
 		contact[id].down = false;
 		if (changed) {
+#if FTS_POST_TO_USER
 			redwood_touch_post(REDWOOD_TOUCH_UP, id, contact[id].x, contact[id].y);
+#endif
+			if (fts_show_post()) {
+				printf("fts: post up id %u at %u, %u\n", (unsigned)id,
+				    (unsigned)contact[id].x, (unsigned)contact[id].y);
+			}
+			fts_posts++;
 		}
 		return true;
 	}
@@ -1119,9 +1266,21 @@ fts_parse(const uint8_t ev[FTS_EVENT_LEN], uint32_t max_x, uint32_t max_y)
 	contact[id].y = y;
 	if (!contact[id].down) {
 		contact[id].down = true;
+#if FTS_POST_TO_USER
 		redwood_touch_post(REDWOOD_TOUCH_DOWN, id, x, y);
+#endif
+		if (fts_show_post()) {
+			printf("fts: post down id %u at %u, %u\n", (unsigned)id, (unsigned)x, (unsigned)y);
+		}
+		fts_posts++;
 	} else if (changed) {
+#if FTS_POST_TO_USER
 		redwood_touch_post(REDWOOD_TOUCH_MOVE, id, x, y);
+#endif
+		if (fts_show_post()) {
+			printf("fts: post move id %u at %u, %u\n", (unsigned)id, (unsigned)x, (unsigned)y);
+		}
+		fts_posts++;
 	}
 	return true;
 }
@@ -1176,16 +1335,35 @@ power_on(void)
 	if (!io_supply_on()) {                          /* vdd: RPMh L1C, 1800 mV */
 		printf("fts: vdd was not turned on\n");
 	}
-	delay(15000);
+	IOSleep(15);
 
 	gpio_drive(GPIO_AVDD, true);                    /* avdd: GPIO 69, enable-active-high */
-	delay(20000);                                   /* the rail settles before the chip is let out */
+	IOSleep(20);                                   /* the rail settles before the chip is let out */
 
 	/*
 	 * ftsCore.c:85 holds the reset line low for 10 ms before releasing it. It has been low since
 	 * the top of this function, so that much is already spent; the release is the pulse.
 	 */
 	gpio_drive(GPIO_RESET, true);                   /* out of reset; the chip boots */
+	/*
+	 * And then it is given time to boot. fts_reset_proc() in the vendor driver leaves 300 ms
+	 * between releasing reset and the first transfer, because the controller runs its own firmware
+	 * before it will answer on the bus. Ten milliseconds was tried here first, and the symptom of
+	 * asking too early is exactly what this driver kept reporting: every byte read back as 0xff,
+	 * because nothing is on the bus yet to acknowledge anything.
+	 */
+	IOSleep(300);
+	/*
+	 * What the three pins actually look like once the rails are up: the level, and whether the
+	 * output driver is on. Reading L1 over SPMI to prove the supply is up turned out to be a way to
+	 * hang this handset -- probing SIDs it does not have -- so the pins are the evidence instead.
+	 * Reset has to read high and AVDD high; if reset sits low the controller is still held in reset
+	 * and will not acknowledge anything on the bus, which looks exactly like an empty bus.
+	 */
+	printf("fts: pins now: reset %u (oe %u), avdd %u (oe %u), irq %u\n",
+	    (uint64_t)gpio_get(GPIO_RESET), (uint64_t)((rd(GPIO_CFG(GPIO_RESET)) & GPIO_OE_BIT) != 0),
+	    (uint64_t)gpio_get(GPIO_AVDD), (uint64_t)((rd(GPIO_CFG(GPIO_AVDD)) & GPIO_OE_BIT) != 0),
+	    (uint64_t)gpio_get(GPIO_IRQ));
 }
 
 static void
@@ -1220,18 +1398,27 @@ touch_thread(void *arg __unused, wait_result_t wresult __unused)
 	 * the reset, and only then is the bus checked to be idle. There is no GENI setup at all --
 	 * that engine is not used for this chip.
 	 */
+	/*
+	 * What the two bus pins were muxed to before this driver took them. Function 0 is plain GPIO,
+	 * function 1 on Kona GPIO36/37 is qup13 -- the GENI I2C engine the boot loader and Android use.
+	 * If they read as 1 here, the engine still owns the pins on this handset and a hand-driven
+	 * transfer has to win them back rather than assume they are already GPIO.
+	 */
+	printf("fts: pins before takeover: gpio%d ctl %#x (func %u), gpio%d ctl %#x (func %u)\n", PIN_SDA,
+	    rd(GPIO_CFG(PIN_SDA)), (unsigned)((rd(GPIO_CFG(PIN_SDA)) & GPIO_FUNC_MASK) >> 2), PIN_SCL,
+	    rd(GPIO_CFG(PIN_SCL)), (unsigned)((rd(GPIO_CFG(PIN_SCL)) & GPIO_FUNC_MASK) >> 2));
 	MARK_NOW(1);
 	i2c_pins_init();
 	delay(5);
-	if (!i2c_read_line(PIN_SDA) || !i2c_read_line(PIN_SCL)) {
-		MARK_BAD(1);
-		printf("fts: the bus is not idle after taking the pins (SDA %u, SCL %u)\n",
-		    (uint64_t)i2c_read_line(PIN_SDA), (uint64_t)i2c_read_line(PIN_SCL));
-		thread_terminate(current_thread());
-		return;
-	}
-	MARK_OK(1);     /* slot 1 green = the pins are taken and the bus is idle */
-	printf("fts: pins taken; SDA and SCL are both high\n");
+	/*
+	 * The bus is deliberately NOT checked for idle here. This used to read SDA and SCL at this
+	 * point and give up when either was low, which it always was: the controller has no supply
+	 * yet, so its pins sit at ground through the chip's own protection diodes. UniXNU-umi checks
+	 * the two lines only after AcquirePins() has powered the rails and pulsed reset, and that is
+	 * the order used from here on.
+	 */
+	printf("fts: pins taken; SDA %u, SCL %u before power (the rails are still off)\n",
+	    (uint64_t)i2c_read_line(PIN_SDA), (uint64_t)i2c_read_line(PIN_SCL));
 
 	/*
 	 * The board's own boost rail first: UniXNU-umi's attempt 80 found this pin latched low and
@@ -1239,6 +1426,9 @@ touch_thread(void *arg __unused, wait_result_t wresult __unused)
 	 */
 	spmi_core = ml_io_map(SPMI_CORE_PHYS, SPMI_CORE_SIZE);
 	spmi_cnfg = ml_io_map(SPMI_CNFG_PHYS, SPMI_CNFG_SIZE);
+	/* The read bank too: every register read goes through a channel of it, so it has to be mapped
+	 * before the first transfer or the first read is a data abort. */
+	spmi_observer = ml_io_map(SPMI_OBSERVER_PHYS, SPMI_OBSERVER_SIZE);
 	if (spmi_core == 0 || spmi_cnfg == 0) {
 		printf("fts: no SPMI registers\n");
 	} else if (rd(spmi_core) != SPMI_ARB_VERSION) {
@@ -1257,8 +1447,24 @@ touch_thread(void *arg __unused, wait_result_t wresult __unused)
 	 * NACK that says nothing about why.
 	 */
 	power_on();
+	delay(5);
 	MARK_OK(2);     /* slot 2 green = powered and out of reset */
 	printf("fts: powered and out of reset; irq line reads %u\n", (uint64_t)gpio_get(GPIO_IRQ));
+
+	/*
+	 * Now the release check UniXNU-umi's AcquirePins() makes once the rails are up: both lines
+	 * must have been let go high by the controller before a start condition can be made. With the
+	 * supply on this is a real answer rather than the unpowered chip holding SDA down.
+	 */
+	if (!i2c_read_line(PIN_SDA) || !i2c_read_line(PIN_SCL)) {
+		MARK_BAD(1);
+		printf("fts: the bus is still not idle after power-up (SDA %u, SCL %u)\n",
+		    (uint64_t)i2c_read_line(PIN_SDA), (uint64_t)i2c_read_line(PIN_SCL));
+		thread_terminate(current_thread());
+		return;
+	}
+	MARK_OK(1);     /* slot 1 green = powered, out of reset, and the bus is idle */
+	printf("fts: bus idle after power-up (SDA and SCL both high)\n");
 
 	MARK_OK(3);     /* slot 3 green = the chip is powered */
 	printf("fts: bus on GPIO %d/%d, supply up, out of reset\n", PIN_SDA, PIN_SCL);
@@ -1272,27 +1478,47 @@ touch_thread(void *arg __unused, wait_result_t wresult __unused)
 	{
 		uint8_t info[FTS_SYSINFO_SIZE];
 		unsigned got = 0;
-		struct fts_sysinfo sys;
+		struct fts_sysinfo sys = { 0 };
+		int attempt;
 
-		problem = fts_read_controller(info, &got);
-		if (problem != NULL) {
-			printf("fts: reading the controller information: %s (%u of %u bytes)\n", problem, got,
-			    (unsigned)FTS_SYSINFO_SIZE);
-			thread_terminate(current_thread());
-			return;
+		/*
+		 * The controller answers the first request only once its own firmware is up. Rather than
+		 * decide on one attempt, ask a few times with a gap: a bus that reads 0xff is a bus with
+		 * nothing listening yet, which is a wait, not a fault.
+		 */
+		for (attempt = 1; attempt <= 6; attempt++) {
+			got = 0;
+			problem = fts_read_controller(info, &got);
+			if (problem == NULL) {
+				sys = fts_sysinfo(info, got);
+				if (sys.valid) {
+					break;
+				}
+			}
+			printf("fts: attempt %d: no usable answer yet (%s, first bytes %02x %02x)\n", attempt,
+			    problem != NULL ? problem : "not a valid block", info[0], info[1]);
+			IOSleep(100);
 		}
-		sys = fts_sysinfo(info, got);
 		if (!sys.valid) {
-			printf("fts: the controller information is not a valid block (%#x %#x, %u bytes)\n",
-			    info[0], info[1], got);
+			printf("fts: the controller never answered (%u bytes, first %02x %02x)\n", got, info[0],
+			    info[1]);
 			thread_terminate(current_thread());
 			return;
 		}
+		printf("fts: answered on attempt %d\n", attempt);
 		printf("fts: chip %#x %#x, fw %#x, svn %#x, config %#x\n", sys.chip0, sys.chip1, sys.fw, sys.svn,
 		    sys.config);
+		/*
+		 * The system information calls the long edge resX and the short edge resY, which is not the
+		 * way round a display has them: this panel reads back 2339 and 1079, while a touch point is
+		 * valid over x 0..1079 and y 0..2339 (UniXNU-umi's umi_fts_parse rejects anything else, and
+		 * umi_fts_report scales x by 1079 and y by 2339). Taking them as they come meant every
+		 * touch past y = 1079 was thrown away as out of range, which is most of the screen, and the
+		 * run looked like "2158 events read, nothing happens".
+		 */
 		if (sys.res_x != 0 && sys.res_y != 0) {
-			max_x = sys.res_x;
-			max_y = sys.res_y;
+			max_x = sys.res_y;
+			max_y = sys.res_x;
 		}
 		/* umi_fts_native_identity_check: the identity this handset reports */
 		if (sys.chip0 != 0x3639 || sys.fw != 0x128 || sys.svn != 0x4053 || sys.config != 0x4b) {
@@ -1362,7 +1588,7 @@ touch_thread(void *arg __unused, wait_result_t wresult __unused)
 			nonempty++;
 			if (!fts_parse(buf, max_x, max_y)) {
 				resets++;
-				printf("fts: controller asked for a reset (%llu events so far)\n", nonempty);
+				printf("fts: controller asked for a reset (%u events so far)\n", (unsigned)nonempty);
 				break;
 			}
 			if (buf[0] != 0) {
@@ -1371,10 +1597,16 @@ touch_thread(void *arg __unused, wait_result_t wresult __unused)
 		}
 		if (mach_absolute_time() >= next_report) {
 			next_report = mach_absolute_time() + report_interval;
-			printf("fts: %llu polls, %llu irq-high, %llu non-empty, %llu events, %llu resets, %llu errors\n",
-			    polls, irq_high, nonempty, points, resets, errors);
+			printf("fts: %u polls, %u irq-high, %u non-empty, %u events, %u resets, %u errors, "
+			    "%u posted\n", (unsigned)polls, (unsigned)irq_high, (unsigned)nonempty,
+			    (unsigned)points, (unsigned)resets, (unsigned)errors, (unsigned)fts_posts);
 		}
-		delay(irq ? 2000 : 8000);                    /* 2 ms while a finger is on it */
+		/*
+		 * IOSleep, not delay(): delay() spins without ever giving the processor up, and this loop
+		 * never ends, so one core stayed pegged for the whole run and the machine never got as far
+		 * as the boot finishing. IOSleep blocks the thread and lets everything else run.
+		 */
+		IOSleep(irq ? 2 : 8);                        /* 2 ms while a finger is on it */
 	}
 }
 

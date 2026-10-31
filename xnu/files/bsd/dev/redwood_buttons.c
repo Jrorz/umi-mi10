@@ -578,15 +578,13 @@ redwood_buttons_init(void)
 	thread_t thread;
 
 	/*
-	 * On with the touch screen (the phone, somebody at it) unless buttons=0 says otherwise: a hand
-	 * has pressed all three keys and each press and release was read as it was made.
+	 * Only with buttons=1. This used to come on whenever touchscreen= was set, on the reasoning that
+	 * a phone with a touch screen has somebody at it -- but on this handset that coupling makes the
+	 * two drivers impossible to work on separately: touchscreen=2 pulled in this one, and this one is
+	 * what asks the kernel for 16 MB it does not get, so the touch driver never got to run and its
+	 * own diagnostics never appeared. The two are set independently now.
 	 */
-	if (!PE_parse_boot_argn("buttons", &enabled, sizeof(enabled))) {
-		uint32_t touch_screen = 0;
-
-		enabled = PE_parse_boot_argn("touchscreen", &touch_screen, sizeof(touch_screen)) && touch_screen != 0;
-	}
-	if (!enabled) {
+	if (!PE_parse_boot_argn("buttons", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
 	PE_parse_boot_argn("buttons_steps", &steps, sizeof(steps));

@@ -220,21 +220,39 @@ redwood_input_init(void)
 	 * these two lines per step the last one printed names it.
 	 */
 /*
- * Both channels, because in the middle of bsd_init neither is certain: kprintf goes to the 16 KB
- * ring the loader reads back, and loader_log_line goes to the loader's own 1.5 MB buffer. If the
- * machine panics in one of these steps, whichever line survives names it.
+ * Each step is named before it runs and again when it returns, so that a panic among them says
+ * which one it was: the last "enter" without its "done" is the one that asked for memory the
+ * kernel did not have.
+ *
+ * Both logging channels are used, because in the middle of bsd_init neither is certain.
+ * kprintf goes to the 16 KB ring the loader reads back through logdump, and loader_log_line goes
+ * to the loader's own 1.5 MB buffer. It matters that the kprintf output lands inside bsd_init's
+ * own window: that window is live right up to bsd_utaskbootstrap, and what follows it is written
+ * by threads that never get to run if the machine panics here.
  */
-	redwood_cpufreq_init();
-	redwood_virtio_input_init();
-	redwood_goodix_init();
-	redwood_touch_i2c_init();
-	redwood_touch_probe_init();
-	redwood_buttons_init();
-	redwood_battery_init();
-	redwood_ufs_init();
-	redwood_net_init();
-	redwood_adreno_init();
-	redwood_wifi_init();
-	redwood_adsp_init();
+#define STEP(name)      do { \
+	        printf("bsd_init: input-init: %s: enter\n", #name); \
+	        loader_log_line("bsd_init: input-init: " #name ": enter"); \
+	        name(); \
+	        printf("bsd_init: input-init: %s: done\n", #name); \
+	        loader_log_line("bsd_init: input-init: " #name ": done"); \
+	} while (0)
+
+	STEP(redwood_cpufreq_init);
+	STEP(redwood_virtio_input_init);
+	STEP(redwood_goodix_init);
+	STEP(redwood_touch_i2c_init);
+	STEP(redwood_touch_probe_init);
+	STEP(redwood_buttons_init);
+	STEP(redwood_battery_init);
+	STEP(redwood_ufs_init);
+	STEP(redwood_net_init);
+	STEP(redwood_adreno_init);
+	STEP(redwood_wifi_init);
+	STEP(redwood_adsp_init);
+
+	printf("bsd_init: input-init: all %d steps returned\n", 12);
+	loader_log_line("bsd_init: input-init: all 12 steps returned");
+#undef STEP
 
 }
